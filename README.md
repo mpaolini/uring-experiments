@@ -1,4 +1,6 @@
-# A weird http client?
+# Experiments with liburing
+
+Just an http client draft.
 
 ## Build
 

@@ -60,14 +60,15 @@ struct step {
   int fd;
   void * data;
   size_t datalen;
+  struct timespec timeout_end;
 };
 
-static void step_send(struct io_uring *ring, int fd, void * data, size_t datalen) {
+static void submit_step_send(struct io_uring *ring, int fd, void * data, size_t datalen) {
   struct io_uring_sqe *sqe;
   struct step *step;
   step = (struct step *) malloc(sizeof(struct step));
   memset(step, 0, sizeof(struct step));
-  step->cur = step_send;
+  step->cur = submit_step_send;
   step->fd = fd;
   step->data = data;
   step->datalen = datalen;
@@ -78,12 +79,12 @@ static void step_send(struct io_uring *ring, int fd, void * data, size_t datalen
   io_uring_submit(ring);
 }
 
-static void step_close(struct io_uring *ring, int fd) {
+static void submit_step_close(struct io_uring *ring, int fd) {
   struct io_uring_sqe *sqe;
   struct step *step;
   step = (struct step *) malloc(sizeof(struct step));
   memset(step, 0, sizeof(struct step));
-  step->cur = step_close;
+  step->cur = submit_step_close;
   step->fd = fd;
   sqe = io_uring_get_sqe(ring);
   assert(sqe);
@@ -92,7 +93,32 @@ static void step_close(struct io_uring *ring, int fd) {
   io_uring_submit(ring);
 }
 
-static int step_connect(struct io_uring *ring, struct addrinfo *addrinfo) {
+static void submit_step_wait(struct io_uring *ring, int fd, int mseconds) {
+  struct io_uring_sqe *sqe;
+  struct step *step;
+  struct __kernel_timespec timeout;
+  memset(&timeout, 0, sizeof(timeout));
+  timeout.tv_sec = mseconds / 1000;
+  timeout.tv_nsec = mseconds % 1000;
+  step = (struct step *) malloc(sizeof(struct step));
+  memset(step, 0, sizeof(struct step));
+  step->cur = submit_step_wait;
+  step->fd = fd;
+  clock_gettime(CLOCK_MONOTONIC, &step->timeout_end);
+  step->timeout_end.tv_sec += timeout.tv_sec;
+  step->timeout_end.tv_nsec += timeout.tv_nsec;
+  if ( step->timeout_end.tv_nsec > 1000000 ) {
+    step->timeout_end.tv_nsec %= 1000000;
+    step->timeout_end.tv_sec++;
+  }
+  sqe = io_uring_get_sqe(ring);
+  assert(sqe);
+  io_uring_prep_timeout(sqe, &timeout, 1, 0);
+  io_uring_sqe_set_data(sqe, step);
+  io_uring_submit(ring);
+}
+
+static int submit_step_connect(struct io_uring *ring, struct addrinfo *addrinfo) {
   int fd = socket(addrinfo->ai_family, addrinfo->ai_socktype, addrinfo->ai_protocol);
   if ( fd < 0 ) {
     fprintf(stderr, "Error opening socket: %s\n", strerror(errno));
@@ -102,7 +128,7 @@ static int step_connect(struct io_uring *ring, struct addrinfo *addrinfo) {
   struct step *step;
   step = (struct step *) malloc(sizeof(struct step));
   memset(step, 0, sizeof(struct step));
-  step->cur = step_connect;
+  step->cur = submit_step_connect;
   step->fd = fd;
   sqe = io_uring_get_sqe(ring);
   assert(sqe);
@@ -124,8 +150,9 @@ int main(int argc, char * argv[]) {
   struct addrinfo addrhints;
   int concurrency;
   int total;
-  if ( argc != 4 ) {
-    fprintf(stderr, "Usage: %s host:port concurrency total\n", argv[0]);
+  int timeout;
+  if ( argc != 5 ) {
+    fprintf(stderr, "Usage: %s host:port concurrency total timeoutmsec\n", argv[0]);
     return 1;
   }
   if ( parse_socket(argv[1], host, hostlen, port, portlen) ) {
@@ -133,6 +160,7 @@ int main(int argc, char * argv[]) {
   }
   concurrency = atoi(argv[2]);
   total = atoi(argv[3]);
+  timeout = atoi(argv[4]);
   int ring_size = 64;
   if ( concurrency <= 0 ) {
     fprintf(stderr, "Error concurrency param is wrong: %s\n", argv[2]);
@@ -165,62 +193,93 @@ int main(int argc, char * argv[]) {
   for (;;) {
     /* queue as many initial requests as possible */
     for (; in_flight < concurrency && in_flight < total - done; ) {
-      if ( step_connect(&ring, addrinfo) ) {
+      if ( submit_step_connect(&ring, addrinfo) ) {
 	fprintf(stderr, "Error in connect step\n");
       } else {
 	in_flight++;
       }
     }
+    /* wait for events on completion queue */
     struct io_uring_cqe *cqe;
-    /* consume one result */
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-      fprintf(stderr, "Error in waiting for completion: %s\n", strerror(-ret));
-      retval = -1;
-      goto exit;
+    for (;;) {
+      ret = io_uring_wait_cqe(&ring, &cqe);
+      if ( ret == -EINTR ) {
+	continue;
+      } else if (ret < 0) {
+	fprintf(stderr, "Error in waiting for completion: %s\n", strerror(-ret));
+	retval = -1;
+	goto exit;
+      } else {
+	break;
+      }
     }
-    /* handle result */
+    /* handle completed event */
     struct step *step = (struct step *) io_uring_cqe_get_data(cqe);
-    if ( step->cur == step_connect ) {
+    if ( step->cur == submit_step_connect ) {
       if ( cqe->res == -EINTR || cqe->res == -EAGAIN ) {
 	fprintf(stderr, "Transient error in step connect, retrying: %s\n", strerror(-cqe->res));
-	step_connect(&ring, addrinfo);
+	submit_step_connect(&ring, addrinfo);
 	in_flight++;
       }	else if ( cqe->res != 0 ) {
 	fprintf(stderr, "Error in step connect: %s\n", strerror(-cqe->res));
-	step_close(&ring, step->fd);
+	submit_step_close(&ring, step->fd);
 	in_flight++;
       } else {
 	fprintf(stderr, "Connected fd %d\n", step->fd);
 	char * post = "POST / HTTP/1.1\r\nHost: localhost:8080\r\nUser-Agent: curl/7.71.1\nAccept: */*\r\n\r\n";
 	void * data = malloc(strlen(post));
 	memcpy(data, post, strlen(post));
-	step_send(&ring, step->fd, data, strlen(post));
+	submit_step_send(&ring, step->fd, data, strlen(post));
 	in_flight++;
       }
-    } else if ( step->cur == step_send ) {
+    } else if ( step->cur == submit_step_send ) {
       if ( cqe->res == -EINTR || cqe->res == -EAGAIN || cqe->res == -EWOULDBLOCK ) {
 	fprintf(stderr, "Transient error in step send, retrying: %s\n", strerror(-cqe->res));
-	step_send(&ring, step->fd, step->data, step->datalen);
+	submit_step_send(&ring, step->fd, step->data, step->datalen);
 	in_flight++;
       }	else if ( cqe->res < 0 ) {
 	fprintf(stderr, "Error in step send: %s\n", strerror(-cqe->res));
-	step_close(&ring, step->fd);
+	submit_step_close(&ring, step->fd);
 	in_flight++;
 	free(step->data);
       } else {
 	fprintf(stderr, "Sent %d bytes to fd %d\n", cqe->res, step->fd);
 	size_t reminder = step->datalen - cqe->res;
 	if ( reminder ) {
-	  step_send(&ring, step->fd, step->data + cqe->res, reminder);
+	  submit_step_send(&ring, step->fd, step->data + cqe->res, reminder);
 	  in_flight++;
 	} else {
-	  step_close(&ring, step->fd);
+	  submit_step_wait(&ring, step->fd, timeout);
 	  in_flight++;
 	  free(step->data);
 	} 
       }
-    } else if ( step->cur == step_close ) {
+    } else if ( step->cur == submit_step_wait ) {
+      if ( cqe->res == -ETIME ) {
+	fprintf(stderr, "Wait finished fd %d\n", step->fd);
+	submit_step_close(&ring, step->fd);
+	in_flight++;
+      } else if ( cqe->res < 0 ) {
+	fprintf(stderr, "Error in step wait: %s\n", strerror(-cqe->res));
+	submit_step_close(&ring, step->fd);
+	in_flight++;
+      } else {
+	struct timespec now;
+	long int now_msec, reminder_msec;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_msec = now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	reminder_msec = now_msec - step->timeout_end.tv_sec * 1000 + step->timeout_end.tv_nsec / 1000000;
+	if ( reminder_msec > 0 ) {
+	  fprintf(stderr, "Wait for %ld more milliseconds on fd %d\n", reminder_msec, step->fd);
+	  submit_step_wait(&ring, step->fd, reminder_msec);
+	  in_flight++;
+	} else {
+	  fprintf(stderr, "Wait finished fd %d\n", step->fd);
+	  submit_step_close(&ring, step->fd);
+	  in_flight++;
+	}	
+      }
+    } else if ( step->cur == submit_step_close ) {
       if ( cqe->res < 0 ) {
 	fprintf(stderr, "Error in step close: %s\n", strerror(-cqe->res));
       } else {
@@ -228,7 +287,6 @@ int main(int argc, char * argv[]) {
       }
       done++;
     } else {
-      fprintf(stderr, "Error unknown step");
       assert(false);
     }
     io_uring_cqe_seen(&ring, cqe);
