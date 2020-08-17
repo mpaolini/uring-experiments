@@ -2,6 +2,7 @@
 
 Just an http client draft.
 
+
 ## Build
 
 ```
@@ -11,3 +12,6 @@ make
 ```
 
 
+## License
+
+MIT (see LICENSE.txt)
